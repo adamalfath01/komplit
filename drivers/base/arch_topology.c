@@ -25,6 +25,7 @@
 #include <linux/cpuset.h>
 
 DEFINE_PER_CPU(unsigned long, freq_scale) = SCHED_CAPACITY_SCALE;
+DEFINE_PER_CPU(unsigned long, efficiency) = SCHED_CAPACITY_SCALE;
 DEFINE_PER_CPU(unsigned long, max_cpu_freq);
 DEFINE_PER_CPU(unsigned long, max_freq_scale) = SCHED_CAPACITY_SCALE;
 
@@ -180,8 +181,7 @@ int detect_share_cap_flag(void)
 		if (!policy)
 			return 0;
 
-		if (share_cap_level < share_cap_thread &&
-			cpumask_equal(topology_sibling_cpumask(cpu),
+		if (cpumask_equal(topology_sibling_cpumask(cpu),
 				  policy->related_cpus)) {
 			share_cap_level = share_cap_thread;
 			cpufreq_cpu_put(policy);
@@ -391,6 +391,7 @@ bool __init topology_parse_cpu_capacity(struct device_node *cpu_node, int cpu)
 	ret = of_property_read_u32(cpu_node, "capacity-dmips-mhz",
 				   &cpu_capacity);
 	if (!ret) {
+		per_cpu(efficiency, cpu) = cpu_capacity;
 		if (!raw_capacity) {
 			raw_capacity = kcalloc(num_possible_cpus(),
 					       sizeof(*raw_capacity),

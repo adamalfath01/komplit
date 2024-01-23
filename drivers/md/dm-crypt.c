@@ -99,7 +99,7 @@ struct crypt_iv_operations {
 };
 
 struct iv_essiv_private {
-	struct crypto_ahash *hash_tfm;
+	struct crypto_shash *hash_tfm;
 	u8 *salt;
 };
 
@@ -125,7 +125,8 @@ struct iv_tcw_private {
  * and encrypts / decrypts at the same time.
  */
 enum flags { DM_CRYPT_SUSPENDED, DM_CRYPT_KEY_VALID,
-	     DM_CRYPT_SAME_CPU, DM_CRYPT_NO_OFFLOAD };
+	     DM_CRYPT_SAME_CPU, DM_CRYPT_NO_OFFLOAD,
+	     DM_CRYPT_ENCRYPT_OVERRIDE };
 
 enum cipher_flags {
 	CRYPT_MODE_INTEGRITY_AEAD,	/* Use authenticated mode for cihper */
@@ -327,25 +328,22 @@ static int crypt_iv_plain64be_gen(struct crypt_config *cc, u8 *iv,
 static int crypt_iv_essiv_init(struct crypt_config *cc)
 {
 	struct iv_essiv_private *essiv = &cc->iv_gen_private.essiv;
-	AHASH_REQUEST_ON_STACK(req, essiv->hash_tfm);
-	struct scatterlist sg;
+	SHASH_DESC_ON_STACK(desc, essiv->hash_tfm);
 	struct crypto_cipher *essiv_tfm;
 	int err;
 
-	sg_init_one(&sg, cc->key, cc->key_size);
-	ahash_request_set_tfm(req, essiv->hash_tfm);
-	ahash_request_set_callback(req, 0, NULL, NULL);
-	ahash_request_set_crypt(req, &sg, essiv->salt, cc->key_size);
+	desc->tfm = essiv->hash_tfm;
+	desc->flags = 0;
 
-	err = crypto_ahash_digest(req);
-	ahash_request_zero(req);
+	err = crypto_shash_digest(desc, cc->key, cc->key_size, essiv->salt);
+	shash_desc_zero(desc);
 	if (err)
 		return err;
 
 	essiv_tfm = cc->iv_private;
 
 	err = crypto_cipher_setkey(essiv_tfm, essiv->salt,
-			    crypto_ahash_digestsize(essiv->hash_tfm));
+			    crypto_shash_digestsize(essiv->hash_tfm));
 	if (err)
 		return err;
 
@@ -356,7 +354,7 @@ static int crypt_iv_essiv_init(struct crypt_config *cc)
 static int crypt_iv_essiv_wipe(struct crypt_config *cc)
 {
 	struct iv_essiv_private *essiv = &cc->iv_gen_private.essiv;
-	unsigned salt_size = crypto_ahash_digestsize(essiv->hash_tfm);
+	unsigned salt_size = crypto_shash_digestsize(essiv->hash_tfm);
 	struct crypto_cipher *essiv_tfm;
 	int r, err = 0;
 
@@ -408,7 +406,7 @@ static void crypt_iv_essiv_dtr(struct crypt_config *cc)
 	struct crypto_cipher *essiv_tfm;
 	struct iv_essiv_private *essiv = &cc->iv_gen_private.essiv;
 
-	crypto_free_ahash(essiv->hash_tfm);
+	crypto_free_shash(essiv->hash_tfm);
 	essiv->hash_tfm = NULL;
 
 	kzfree(essiv->salt);
@@ -426,7 +424,7 @@ static int crypt_iv_essiv_ctr(struct crypt_config *cc, struct dm_target *ti,
 			      const char *opts)
 {
 	struct crypto_cipher *essiv_tfm = NULL;
-	struct crypto_ahash *hash_tfm = NULL;
+	struct crypto_shash *hash_tfm = NULL;
 	u8 *salt = NULL;
 	int err;
 
@@ -436,14 +434,14 @@ static int crypt_iv_essiv_ctr(struct crypt_config *cc, struct dm_target *ti,
 	}
 
 	/* Allocate hash algorithm */
-	hash_tfm = crypto_alloc_ahash(opts, 0, CRYPTO_ALG_ASYNC);
+	hash_tfm = crypto_alloc_shash(opts, 0, 0);
 	if (IS_ERR(hash_tfm)) {
 		ti->error = "Error initializing ESSIV hash";
 		err = PTR_ERR(hash_tfm);
 		goto bad;
 	}
 
-	salt = kzalloc(crypto_ahash_digestsize(hash_tfm), GFP_KERNEL);
+	salt = kzalloc(crypto_shash_digestsize(hash_tfm), GFP_KERNEL);
 	if (!salt) {
 		ti->error = "Error kmallocing salt storage in ESSIV";
 		err = -ENOMEM;
@@ -454,7 +452,7 @@ static int crypt_iv_essiv_ctr(struct crypt_config *cc, struct dm_target *ti,
 	cc->iv_gen_private.essiv.hash_tfm = hash_tfm;
 
 	essiv_tfm = alloc_essiv_cipher(cc, ti, salt,
-				       crypto_ahash_digestsize(hash_tfm));
+				       crypto_shash_digestsize(hash_tfm));
 	if (IS_ERR(essiv_tfm)) {
 		crypt_iv_essiv_dtr(cc);
 		return PTR_ERR(essiv_tfm);
@@ -465,7 +463,7 @@ static int crypt_iv_essiv_ctr(struct crypt_config *cc, struct dm_target *ti,
 
 bad:
 	if (hash_tfm && !IS_ERR(hash_tfm))
-		crypto_free_ahash(hash_tfm);
+		crypto_free_shash(hash_tfm);
 	kfree(salt);
 	return err;
 }
@@ -2682,6 +2680,8 @@ static int crypt_ctr_optional(struct dm_target *ti, unsigned int argc, char **ar
 			cc->sector_shift = __ffs(cc->sector_size) - SECTOR_SHIFT;
 		} else if (!strcasecmp(opt_string, "iv_large_sectors"))
 			set_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags);
+		else if (!strcasecmp(opt_string, "allow_encrypt_override"))
+			set_bit(DM_CRYPT_ENCRYPT_OVERRIDE, &cc->flags);
 		else {
 			ti->error = "Invalid feature arguments";
 			return -EINVAL;
@@ -2891,12 +2891,15 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 	struct crypt_config *cc = ti->private;
 
 	/*
-	 * If bio is REQ_PREFLUSH or REQ_OP_DISCARD, just bypass crypt queues.
+	 * If bio is REQ_PREFLUSH, REQ_NOENCRYPT, or REQ_OP_DISCARD,
+	 * just bypass crypt queues.
 	 * - for REQ_PREFLUSH device-mapper core ensures that no IO is in-flight
 	 * - for REQ_OP_DISCARD caller must use flush if IO ordering matters
 	 */
-	if (unlikely(bio->bi_opf & REQ_PREFLUSH ||
-	    bio_op(bio) == REQ_OP_DISCARD)) {
+	if (unlikely(bio->bi_opf & REQ_PREFLUSH) ||
+	    (unlikely(bio->bi_opf & REQ_NOENCRYPT) &&
+	     test_bit(DM_CRYPT_ENCRYPT_OVERRIDE, &cc->flags)) ||
+	    bio_op(bio) == REQ_OP_DISCARD) {
 		bio_set_dev(bio, cc->dev->bdev);
 		if (bio_sectors(bio))
 			bio->bi_iter.bi_sector = cc->start +
@@ -2983,6 +2986,8 @@ static void crypt_status(struct dm_target *ti, status_type_t type,
 		num_feature_args += test_bit(DM_CRYPT_NO_OFFLOAD, &cc->flags);
 		num_feature_args += cc->sector_size != (1 << SECTOR_SHIFT);
 		num_feature_args += test_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags);
+		num_feature_args += test_bit(DM_CRYPT_ENCRYPT_OVERRIDE,
+							&cc->flags);
 		if (cc->on_disk_tag_size)
 			num_feature_args++;
 		if (num_feature_args) {
@@ -2999,6 +3004,8 @@ static void crypt_status(struct dm_target *ti, status_type_t type,
 				DMEMIT(" sector_size:%d", cc->sector_size);
 			if (test_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags))
 				DMEMIT(" iv_large_sectors");
+			if (test_bit(DM_CRYPT_ENCRYPT_OVERRIDE, &cc->flags))
+				DMEMIT(" allow_encrypt_override");
 		}
 
 		break;

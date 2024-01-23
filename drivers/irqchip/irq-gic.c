@@ -41,6 +41,8 @@
 #include <linux/irqchip.h>
 #include <linux/irqchip/chained_irq.h>
 #include <linux/irqchip/arm-gic.h>
+#include <linux/msm_rtb.h>
+#include <linux/wakeup_reason.h>
 
 #include <asm/cputype.h>
 #include <asm/irq.h>
@@ -357,6 +359,7 @@ static void __exception_irq_entry gic_handle_irq(struct pt_regs *regs)
 				writel_relaxed(irqstat, cpu_base + GIC_CPU_EOI);
 			isb();
 			handle_domain_irq(gic->domain, irqnr, regs);
+			uncached_logk(LOGK_IRQ, (void *)(uintptr_t)irqnr);
 			continue;
 		}
 		if (irqnr < 16) {
@@ -374,18 +377,20 @@ static void __exception_irq_entry gic_handle_irq(struct pt_regs *regs)
 			smp_rmb();
 			handle_IPI(irqnr, regs);
 #endif
+			uncached_logk(LOGK_IRQ, (void *)(uintptr_t)irqnr);
 			continue;
 		}
 		break;
 	} while (1);
 }
 
-static void gic_handle_cascade_irq(struct irq_desc *desc)
+static bool gic_handle_cascade_irq(struct irq_desc *desc)
 {
 	struct gic_chip_data *chip_data = irq_desc_get_handler_data(desc);
 	struct irq_chip *chip = irq_desc_get_chip(desc);
 	unsigned int cascade_irq, gic_irq;
 	unsigned long status;
+	int handled = false;
 
 	chained_irq_enter(chip, desc);
 
@@ -400,11 +405,12 @@ static void gic_handle_cascade_irq(struct irq_desc *desc)
 		handle_bad_irq(desc);
 	} else {
 		isb();
-		generic_handle_irq(cascade_irq);
+		handled = generic_handle_irq(cascade_irq);
 	}
 
  out:
 	chained_irq_exit(chip, desc);
+	return handled;
 }
 
 static const struct irq_chip gic_chip = {
@@ -707,7 +713,8 @@ void gic_cpu_restore(struct gic_chip_data *gic)
 	gic_cpu_if_up(gic);
 }
 
-static int gic_notifier(struct notifier_block *self, unsigned long cmd,	void *v)
+static int gic_notifier(struct notifier_block *self, unsigned long cmd,
+			void *aff_level)
 {
 	int i;
 
@@ -726,11 +733,20 @@ static int gic_notifier(struct notifier_block *self, unsigned long cmd,	void *v)
 			gic_cpu_restore(&gic_data[i]);
 			break;
 		case CPU_CLUSTER_PM_ENTER:
-			gic_dist_save(&gic_data[i]);
+			/*
+			 * Affinity level of the node
+			 * eg:
+			 *    cpu level = 0
+			 *    l2 level  = 1
+			 *    cci level = 2
+			 */
+			if (!(unsigned long)aff_level)
+				gic_dist_save(&gic_data[i]);
 			break;
 		case CPU_CLUSTER_PM_ENTER_FAILED:
 		case CPU_CLUSTER_PM_EXIT:
-			gic_dist_restore(&gic_data[i]);
+			if (!(unsigned long)aff_level)
+				gic_dist_restore(&gic_data[i]);
 			break;
 		}
 	}

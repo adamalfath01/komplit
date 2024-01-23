@@ -135,6 +135,7 @@ static void free_event_data(struct work_struct *work)
 	cpumask_t *mask;
 	struct etm_event_data *event_data;
 	struct coresight_device *sink;
+	struct coresight_device *source;
 
 	event_data = container_of(work, struct etm_event_data, work);
 	mask = &event_data->mask;
@@ -152,9 +153,10 @@ static void free_event_data(struct work_struct *work)
 	for_each_cpu(cpu, mask) {
 		struct list_head **ppath;
 
+		source = coresight_get_source(event_data->path[cpu]);
 		ppath = etm_event_cpu_path_ptr(event_data, cpu);
 		if (!(IS_ERR_OR_NULL(*ppath)))
-			coresight_release_path(*ppath);
+			coresight_release_path(source, *ppath);
 		*ppath = NULL;
 	}
 

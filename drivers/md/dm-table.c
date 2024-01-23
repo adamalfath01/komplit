@@ -1694,7 +1694,34 @@ static int queue_no_sg_merge(struct dm_target *ti, struct dm_dev *dev,
 {
 	struct request_queue *q = bdev_get_queue(dev->bdev);
 
-	return q && test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags);
+	return q && !test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags);
+}
+
+static int queue_supports_inline_encryption(struct dm_target *ti,
+					    struct dm_dev *dev,
+					    sector_t start, sector_t len,
+					    void *data)
+{
+	struct request_queue *q = bdev_get_queue(dev->bdev);
+
+	return q && blk_queue_inlinecrypt(q);
+}
+
+static bool dm_table_all_devices_attribute(struct dm_table *t,
+					   iterate_devices_callout_fn func)
+{
+	struct dm_target *ti;
+	unsigned i;
+
+	for (i = 0; i < dm_table_get_num_targets(t); i++) {
+		ti = dm_table_get_target(t, i);
+
+		if (!ti->type->iterate_devices ||
+		    !ti->type->iterate_devices(ti, func, NULL))
+			return false;
+	}
+
+	return true;
 }
 
 static int device_not_write_same_capable(struct dm_target *ti, struct dm_dev *dev,
@@ -1838,6 +1865,11 @@ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
 		queue_flag_set_unlocked(QUEUE_FLAG_NO_SG_MERGE, q);
 	else
 		queue_flag_clear_unlocked(QUEUE_FLAG_NO_SG_MERGE, q);
+
+	if (dm_table_all_devices_attribute(t, queue_supports_inline_encryption))
+		queue_flag_set_unlocked(QUEUE_FLAG_INLINECRYPT, q);
+	else
+		queue_flag_clear_unlocked(QUEUE_FLAG_INLINECRYPT, q);
 
 	dm_table_verify_integrity(t);
 

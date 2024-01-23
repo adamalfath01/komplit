@@ -5,6 +5,15 @@
 
 # Each configuration option enables a list of files.
 
+# HMI_M516_A01
+obj-$(CONFIG_TOUCHSCREEN_XIAOMI_C3J) += lct_tp_info.o
+obj-$(CONFIG_TOUCHSCREEN_XIAOMI_C3J) += lct_tp_selftest.o
+obj-$(CONFIG_TOUCHSCREEN_XIAOMI_C3J) += lct_tp_gesture.o
+obj-$(CONFIG_TOUCHSCREEN_XIAOMI_C3J) += lct_tp_grip_area.o
+obj-$(CONFIG_TOUCHSCREEN_XIAOMI_C3J) += lct_tp_work.o
+obj-$(CONFIG_TOUCHSCREEN_XIAOMI_C3J) += nt36xxx_spi_c3j/
+obj-$(CONFIG_TOUCHSCREEN_XIAOMI_C3J) += ft8719_spi_c3j/
+
 wm97xx-ts-y := wm97xx-core.o
 
 obj-$(CONFIG_TOUCHSCREEN_PROPERTIES)	+= of_touchscreen.o
@@ -73,6 +82,7 @@ obj-$(CONFIG_TOUCHSCREEN_STMPE)		+= stmpe-ts.o
 obj-$(CONFIG_TOUCHSCREEN_SUN4I)		+= sun4i-ts.o
 obj-$(CONFIG_TOUCHSCREEN_SUR40)		+= sur40.o
 obj-$(CONFIG_TOUCHSCREEN_SURFACE3_SPI)	+= surface3_spi.o
+obj-$(CONFIG_TOUCHSCREEN_SYNAPTICS_DSX) += synaptics_dsx/
 obj-$(CONFIG_TOUCHSCREEN_TI_AM335X_TSC)	+= ti_am335x_tsc.o
 obj-$(CONFIG_TOUCHSCREEN_TOUCHIT213)	+= touchit213.o
 obj-$(CONFIG_TOUCHSCREEN_TOUCHRIGHT)	+= touchright.o
@@ -104,3 +114,10 @@ obj-$(CONFIG_TOUCHSCREEN_ZET6223)	+= zet6223.o
 obj-$(CONFIG_TOUCHSCREEN_ZFORCE)	+= zforce_ts.o
 obj-$(CONFIG_TOUCHSCREEN_COLIBRI_VF50)	+= colibri-vf50-ts.o
 obj-$(CONFIG_TOUCHSCREEN_ROHM_BU21023)	+= rohm_bu21023.o
+obj-$(CONFIG_TOUCHSCREEN_ST)		+= st/
+obj-$(CONFIG_TOUCHSCREEN_HIMAX_CHIPSET)	+= hxchipset/
+obj-$(CONFIG_TOUCHSCREEN_SYNAPTICS_TCM)	+= synaptics_tcm/
+obj-$(CONFIG_TOUCHSCREEN_RAYDIUM_CHIPSET)  += raydium_wt030/
+obj-$(CONFIG_TOUCHSCREEN_XIAOMI_C3J)	+= nt36xxx_spi_c3j/
+obj-$(CONFIG_TOUCHSCREEN_XIAOMI_C3J)	+= ft8719_spi_c3j/
+obj-$(CONFIG_TOUCHSCREEN_COMMON)	+= tp_common.o
