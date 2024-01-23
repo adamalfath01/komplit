@@ -116,8 +116,7 @@ struct kioctx {
 	struct page		**ring_pages;
 	long			nr_pages;
 
-	struct rcu_head		free_rcu;
-	struct work_struct	free_work;	/* see free_ioctx() */
+	struct rcu_work		free_rwork;	/* see free_ioctx() */
 
 	/*
 	 * signals when all in-flight requests are done
@@ -558,13 +557,12 @@ void kiocb_set_cancel_fn(struct kiocb *iocb, kiocb_cancel_fn *cancel)
 	struct kioctx *ctx = req->ki_ctx;
 	unsigned long flags;
 
+	if (WARN_ON_ONCE(!list_empty(&req->ki_list)))
+		return;
+
 	spin_lock_irqsave(&ctx->ctx_lock, flags);
-
-	if (!req->ki_list.next)
-		list_add(&req->ki_list, &ctx->active_reqs);
-
+	list_add_tail(&req->ki_list, &ctx->active_reqs);
 	req->ki_cancel = cancel;
-
 	spin_unlock_irqrestore(&ctx->ctx_lock, flags);
 }
 EXPORT_SYMBOL(kiocb_set_cancel_fn);
@@ -593,13 +591,12 @@ static int kiocb_cancel(struct aio_kiocb *kiocb)
 /*
  * free_ioctx() should be RCU delayed to synchronize against the RCU
  * protected lookup_ioctx() and also needs process context to call
- * aio_free_ring(), so the double bouncing through kioctx->free_rcu and
- * ->free_work.
+ * aio_free_ring().  Use rcu_work.
  */
 static void free_ioctx(struct work_struct *work)
 {
-	struct kioctx *ctx = container_of(work, struct kioctx, free_work);
-
+	struct kioctx *ctx = container_of(to_rcu_work(work), struct kioctx,
+					  free_rwork);
 	pr_debug("freeing %p\n", ctx);
 
 	aio_free_ring(ctx);
@@ -607,14 +604,6 @@ static void free_ioctx(struct work_struct *work)
 	percpu_ref_exit(&ctx->reqs);
 	percpu_ref_exit(&ctx->users);
 	kmem_cache_free(kioctx_cachep, ctx);
-}
-
-static void free_ioctx_rcufn(struct rcu_head *head)
-{
-	struct kioctx *ctx = container_of(head, struct kioctx, free_rcu);
-
-	INIT_WORK(&ctx->free_work, free_ioctx);
-	schedule_work(&ctx->free_work);
 }
 
 static void free_ioctx_reqs(struct percpu_ref *ref)
@@ -626,7 +615,8 @@ static void free_ioctx_reqs(struct percpu_ref *ref)
 		complete(&ctx->rq_wait->comp);
 
 	/* Synchronize against RCU protected table->table[] dereferences */
-	call_rcu(&ctx->free_rcu, free_ioctx_rcufn);
+	INIT_RCU_WORK(&ctx->free_rwork, free_ioctx);
+	queue_rcu_work(system_wq, &ctx->free_rwork);
 }
 
 /*
@@ -1051,7 +1041,7 @@ static inline struct aio_kiocb *aio_get_req(struct kioctx *ctx)
 		goto out_put;
 
 	percpu_ref_get(&ctx->reqs);
-
+	INIT_LIST_HEAD(&req->ki_list);
 	req->ki_ctx = ctx;
 	return req;
 out_put:
@@ -1120,16 +1110,7 @@ static void aio_complete(struct kiocb *kiocb, long res, long res2)
 		file_end_write(file);
 	}
 
-	/*
-	 * Special case handling for sync iocbs:
-	 *  - events go directly into the iocb for fast handling
-	 *  - the sync task with the iocb in its stack holds the single iocb
-	 *    ref, no other paths have a way to get another ref
-	 *  - the sync task helpfully left a reference to itself in the iocb
-	 */
-	BUG_ON(is_sync_kiocb(kiocb));
-
-	if (iocb->ki_list.next) {
+	if (!list_empty_careful(&iocb->ki_list)) {
 		unsigned long flags;
 
 		spin_lock_irqsave(&ctx->ctx_lock, flags);
@@ -1669,7 +1650,6 @@ static long do_io_submit(aio_context_t ctx_id, long nr,
 	struct kioctx *ctx;
 	long ret = 0;
 	int i = 0;
-	struct blk_plug plug;
 
 	if (unlikely(nr < 0))
 		return -EINVAL;
@@ -1686,7 +1666,6 @@ static long do_io_submit(aio_context_t ctx_id, long nr,
 		return -EINVAL;
 	}
 
-	blk_start_plug(&plug);
 
 	/*
 	 * AKPM: should this return a partial result if some of the IOs were
@@ -1710,7 +1689,6 @@ static long do_io_submit(aio_context_t ctx_id, long nr,
 		if (ret)
 			break;
 	}
-	blk_finish_plug(&plug);
 
 	percpu_ref_put(&ctx->users);
 	return i ? i : ret;
