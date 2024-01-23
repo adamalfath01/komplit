@@ -715,11 +715,21 @@ static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
 	dump_stack();
 }
 
+#ifdef CONFIG_SLUB_DEBUG_PANIC_ON
+static void slab_panic(const char *cause)
+{
+	panic("%s\n", cause);
+}
+#else
+static inline void slab_panic(const char *cause) {}
+#endif
+
 void object_err(struct kmem_cache *s, struct page *page,
 			u8 *object, char *reason)
 {
 	slab_bug(s, "%s", reason);
 	print_trailer(s, page, object);
+	slab_panic(reason);
 }
 
 static __printf(3, 4) void slab_err(struct kmem_cache *s, struct page *page,
@@ -734,6 +744,7 @@ static __printf(3, 4) void slab_err(struct kmem_cache *s, struct page *page,
 	slab_bug(s, "%s", buf);
 	print_page_info(page);
 	dump_stack();
+	slab_panic("slab error");
 }
 
 static void init_object(struct kmem_cache *s, void *object, u8 val)
@@ -755,6 +766,7 @@ static void init_object(struct kmem_cache *s, void *object, u8 val)
 static void restore_bytes(struct kmem_cache *s, char *message, u8 data,
 						void *from, void *to)
 {
+	slab_panic("object poison overwritten");
 	slab_fix(s, "Restoring 0x%p-0x%p=0x%x\n", from, to - 1, data);
 	memset(from, data, to - from);
 }
@@ -1371,13 +1383,13 @@ static inline void kmalloc_large_node_hook(void *ptr, size_t size, gfp_t flags)
 	kasan_kmalloc_large(ptr, size, flags);
 }
 
-static inline void kfree_hook(const void *x)
+static __always_inline void kfree_hook(void *x)
 {
 	kmemleak_free(x);
-	kasan_kfree_large(x);
+	kasan_kfree_large(x, _RET_IP_);
 }
 
-static inline void *slab_free_hook(struct kmem_cache *s, void *x)
+static __always_inline void *slab_free_hook(struct kmem_cache *s, void *x)
 {
 	void *freeptr;
 
@@ -1405,7 +1417,7 @@ static inline void *slab_free_hook(struct kmem_cache *s, void *x)
 	 * kasan_slab_free() may put x into memory quarantine, delaying its
 	 * reuse. In this case the object's freelist pointer is changed.
 	 */
-	kasan_slab_free(s, x);
+	kasan_slab_free(s, x, _RET_IP_);
 	return freeptr;
 }
 
@@ -1491,6 +1503,25 @@ static int init_cache_random_seq(struct kmem_cache *s)
 	return 0;
 }
 
+/* re-initialize the random sequence cache */
+static int reinit_cache_random_seq(struct kmem_cache *s)
+{
+	int err;
+
+	if (s->random_seq) {
+		cache_random_seq_destroy(s);
+		err = init_cache_random_seq(s);
+
+		if (err) {
+			pr_err("SLUB: Unable to re-initialize random sequence cache for %s\n",
+				s->name);
+			return err;
+		}
+	}
+
+	return 0;
+}
+
 /* Initialize each random sequence freelist per cache */
 static void __init init_freelist_randomization(void)
 {
@@ -1562,6 +1593,10 @@ static bool shuffle_freelist(struct kmem_cache *s, struct page *page)
 }
 #else
 static inline int init_cache_random_seq(struct kmem_cache *s)
+{
+	return 0;
+}
+static inline int reinit_cache_random_seq(struct kmem_cache *s)
 {
 	return 0;
 }
@@ -1697,6 +1732,7 @@ static void __free_slab(struct kmem_cache *s, struct page *page)
 	if (current->reclaim_state)
 		current->reclaim_state->reclaimed_slab += pages;
 	memcg_uncharge_slab(page, order, s);
+	kasan_alloc_pages(page, order);
 	__free_pages(page, order);
 }
 
@@ -1877,7 +1913,7 @@ static void *get_any_partial(struct kmem_cache *s, gfp_t flags,
 	struct zonelist *zonelist;
 	struct zoneref *z;
 	struct zone *zone;
-	enum zone_type high_zoneidx = gfp_zone(flags);
+	enum zone_type highest_zoneidx = gfp_zone(flags);
 	void *object;
 	unsigned int cpuset_mems_cookie;
 
@@ -1906,7 +1942,7 @@ static void *get_any_partial(struct kmem_cache *s, gfp_t flags,
 	do {
 		cpuset_mems_cookie = read_mems_allowed_begin();
 		zonelist = node_zonelist(mempolicy_slab_node(), flags);
-		for_each_zone_zonelist(zone, z, zonelist, high_zoneidx) {
+		for_each_zone_zonelist(zone, z, zonelist, highest_zoneidx) {
 			struct kmem_cache_node *n;
 
 			n = get_node(s, zone_to_nid(zone));
@@ -3936,7 +3972,8 @@ void kfree(const void *x)
 	page = virt_to_head_page(x);
 	if (unlikely(!PageSlab(page))) {
 		BUG_ON(!PageCompound(page));
-		kfree_hook(x);
+		kfree_hook(object);
+		kasan_alloc_pages(page, compound_order(page));
 		__free_pages(page, compound_order(page));
 		return;
 	}
@@ -4701,6 +4738,7 @@ static int list_locations(struct kmem_cache *s, char *buf,
 static void __init resiliency_test(void)
 {
 	u8 *p;
+	int type = KMALLOC_NORMAL;
 
 	BUILD_BUG_ON(KMALLOC_MIN_SIZE > 16 || KMALLOC_SHIFT_HIGH < 10);
 
@@ -4713,7 +4751,7 @@ static void __init resiliency_test(void)
 	pr_err("\n1. kmalloc-16: Clobber Redzone/next pointer 0x12->0x%p\n\n",
 	       p + 16);
 
-	validate_slab_cache(kmalloc_caches[4]);
+	validate_slab_cache(kmalloc_caches[type][4]);
 
 	/* Hmmm... The next two are dangerous */
 	p = kzalloc(32, GFP_KERNEL);
@@ -4722,33 +4760,33 @@ static void __init resiliency_test(void)
 	       p);
 	pr_err("If allocated object is overwritten then not detectable\n\n");
 
-	validate_slab_cache(kmalloc_caches[5]);
+	validate_slab_cache(kmalloc_caches[type][5]);
 	p = kzalloc(64, GFP_KERNEL);
 	p += 64 + (get_cycles() & 0xff) * sizeof(void *);
 	*p = 0x56;
 	pr_err("\n3. kmalloc-64: corrupting random byte 0x56->0x%p\n",
 	       p);
 	pr_err("If allocated object is overwritten then not detectable\n\n");
-	validate_slab_cache(kmalloc_caches[6]);
+	validate_slab_cache(kmalloc_caches[type][6]);
 
 	pr_err("\nB. Corruption after free\n");
 	p = kzalloc(128, GFP_KERNEL);
 	kfree(p);
 	*p = 0x78;
 	pr_err("1. kmalloc-128: Clobber first word 0x78->0x%p\n\n", p);
-	validate_slab_cache(kmalloc_caches[7]);
+	validate_slab_cache(kmalloc_caches[type][7]);
 
 	p = kzalloc(256, GFP_KERNEL);
 	kfree(p);
 	p[50] = 0x9a;
 	pr_err("\n2. kmalloc-256: Clobber 50th byte 0x9a->0x%p\n\n", p);
-	validate_slab_cache(kmalloc_caches[8]);
+	validate_slab_cache(kmalloc_caches[type][8]);
 
 	p = kzalloc(512, GFP_KERNEL);
 	kfree(p);
 	p[512] = 0xab;
 	pr_err("\n3. kmalloc-512: Clobber redzone 0xab->0x%p\n\n", p);
-	validate_slab_cache(kmalloc_caches[9]);
+	validate_slab_cache(kmalloc_caches[type][9]);
 }
 #else
 #ifdef CONFIG_SYSFS
@@ -4962,6 +5000,7 @@ static ssize_t order_store(struct kmem_cache *s,
 		return -EINVAL;
 
 	calculate_sizes(s, order);
+	reinit_cache_random_seq(s);
 	return length;
 }
 
@@ -5199,6 +5238,7 @@ static ssize_t red_zone_store(struct kmem_cache *s,
 		s->flags |= SLAB_RED_ZONE;
 	}
 	calculate_sizes(s, -1);
+	reinit_cache_random_seq(s);
 	return length;
 }
 SLAB_ATTR(red_zone);
@@ -5219,6 +5259,7 @@ static ssize_t poison_store(struct kmem_cache *s,
 		s->flags |= SLAB_POISON;
 	}
 	calculate_sizes(s, -1);
+	reinit_cache_random_seq(s);
 	return length;
 }
 SLAB_ATTR(poison);
@@ -5240,6 +5281,7 @@ static ssize_t store_user_store(struct kmem_cache *s,
 		s->flags |= SLAB_STORE_USER;
 	}
 	calculate_sizes(s, -1);
+	reinit_cache_random_seq(s);
 	return length;
 }
 SLAB_ATTR(store_user);
