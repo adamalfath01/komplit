@@ -47,6 +47,7 @@ struct xfrm_flo {
 
 static DEFINE_SPINLOCK(xfrm_if_cb_lock);
 static struct xfrm_if_cb const __rcu *xfrm_if_cb __read_mostly;
+
 static DEFINE_SPINLOCK(xfrm_policy_afinfo_lock);
 static struct xfrm_policy_afinfo const __rcu *xfrm_policy_afinfo[AF_INET6 + 1]
 						__read_mostly;
@@ -799,8 +800,9 @@ int xfrm_policy_insert(int dir, struct xfrm_policy *policy, int excl)
 }
 EXPORT_SYMBOL(xfrm_policy_insert);
 
-struct xfrm_policy *xfrm_policy_bysel_ctx(struct net *net, const struct xfrm_mark *mark, u32 if_id,
-					  u8 type, int dir, struct xfrm_selector *sel,
+struct xfrm_policy *xfrm_policy_bysel_ctx(struct net *net, u32 mark, u32 if_id,
+					  u8 type, int dir,
+					  struct xfrm_selector *sel,
 					  struct xfrm_sec_ctx *ctx, int delete,
 					  int *err)
 {
@@ -814,7 +816,7 @@ struct xfrm_policy *xfrm_policy_bysel_ctx(struct net *net, const struct xfrm_mar
 	hlist_for_each_entry(pol, chain, bydst) {
 		if (pol->type == type &&
 		    pol->if_id == if_id &&
-		    xfrm_policy_mark_match(mark, pol) &&
+		    (mark & pol->mark.m) == pol->mark.v &&
 		    !selector_cmp(sel, &pol->selector) &&
 		    xfrm_sec_ctx_match(ctx, pol->security)) {
 			xfrm_pol_hold(pol);
@@ -839,8 +841,9 @@ struct xfrm_policy *xfrm_policy_bysel_ctx(struct net *net, const struct xfrm_mar
 }
 EXPORT_SYMBOL(xfrm_policy_bysel_ctx);
 
-struct xfrm_policy *xfrm_policy_byid(struct net *net, const struct xfrm_mark *mark, u32 if_id,
-					 u8 type, int dir, u32 id, int delete, int *err)
+struct xfrm_policy *xfrm_policy_byid(struct net *net, u32 mark, u32 if_id,
+				     u8 type, int dir, u32 id, int delete,
+				     int *err)
 {
 	struct xfrm_policy *pol, *ret;
 	struct hlist_head *chain;
@@ -856,7 +859,7 @@ struct xfrm_policy *xfrm_policy_byid(struct net *net, const struct xfrm_mark *ma
 	hlist_for_each_entry(pol, chain, byidx) {
 		if (pol->type == type && pol->index == id &&
 		    pol->if_id == if_id &&
-		    xfrm_policy_mark_match(mark, pol)) {
+		    (mark & pol->mark.m) == pol->mark.v) {
 			xfrm_pol_hold(pol);
 			if (delete) {
 				*err = security_xfrm_policy_delete(

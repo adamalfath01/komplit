@@ -458,8 +458,15 @@ do_pass:
 				break;
 
 			if (fp->code == (BPF_ALU | BPF_DIV | BPF_X) ||
-			    fp->code == (BPF_ALU | BPF_MOD | BPF_X))
+			    fp->code == (BPF_ALU | BPF_MOD | BPF_X)) {
 				*insn++ = BPF_MOV32_REG(BPF_REG_X, BPF_REG_X);
+				/* Error with exception code on div/mod by 0.
+				 * For cBPF programs, this was always return 0.
+				 */
+				*insn++ = BPF_JMP_IMM(BPF_JNE, BPF_REG_X, 0, 2);
+				*insn++ = BPF_ALU32_REG(BPF_XOR, BPF_REG_A, BPF_REG_A);
+				*insn++ = BPF_EXIT_INSN();
+			}
 
 			*insn = BPF_RAW_INSN(fp->code, BPF_REG_A, BPF_REG_X, 0, fp->k);
 			break;
@@ -2104,6 +2111,8 @@ static int bpf_skb_proto_4_to_6(struct sk_buff *skb)
 			skb_shinfo(skb)->gso_type |=  SKB_GSO_TCPV6;
 		}
 
+		/* Due to IPv6 header, MSS needs to be downgraded. */
+		skb_shinfo(skb)->gso_size -= len_diff;
 		/* Header must be checked, and gso_segs recomputed. */
 		skb_shinfo(skb)->gso_type |= SKB_GSO_DODGY;
 		skb_shinfo(skb)->gso_segs = 0;
@@ -2138,6 +2147,8 @@ static int bpf_skb_proto_6_to_4(struct sk_buff *skb)
 			skb_shinfo(skb)->gso_type |=  SKB_GSO_TCPV4;
 		}
 
+		/* Due to IPv4 header, MSS can be upgraded. */
+		skb_shinfo(skb)->gso_size += len_diff;
 		/* Header must be checked, and gso_segs recomputed. */
 		skb_shinfo(skb)->gso_type |= SKB_GSO_DODGY;
 		skb_shinfo(skb)->gso_segs = 0;
@@ -2282,6 +2293,12 @@ static int bpf_skb_net_shrink(struct sk_buff *skb, u32 len_diff)
 	return 0;
 }
 
+static u32 __bpf_skb_max_len(const struct sk_buff *skb)
+{
+	if (skb_at_tc_ingress(skb) || !skb->dev)
+		return SKB_MAX_ALLOC;
+	return skb->dev->mtu + skb->dev->hard_header_len;
+}
 #define BPF_SKB_MAX_LEN SKB_MAX_ALLOC
 
 static int bpf_skb_adjust_net(struct sk_buff *skb, s32 len_diff)
@@ -3190,8 +3207,6 @@ bpf_base_func_proto(enum bpf_func_id func_id)
 		return &bpf_tail_call_proto;
 	case BPF_FUNC_ktime_get_ns:
 		return &bpf_ktime_get_ns_proto;
-	case BPF_FUNC_ktime_get_boot_ns:
-		return &bpf_ktime_get_boot_ns_proto;
 	case BPF_FUNC_trace_printk:
 		if (capable(CAP_SYS_ADMIN))
 			return bpf_get_trace_printk_proto();
