@@ -66,7 +66,7 @@ void blk_rq_bio_prep(struct request_queue *q, struct request *rq,
 void blk_queue_bypass_start(struct request_queue *q);
 void blk_queue_bypass_end(struct request_queue *q);
 void __blk_queue_free_tags(struct request_queue *q);
-void blk_freeze_queue(struct request_queue *q);
+bool blk_freeze_queue(struct request_queue *q);
 
 static inline void blk_queue_enter_live(struct request_queue *q)
 {
@@ -265,9 +265,7 @@ extern int blk_update_nr_requests(struct request_queue *, unsigned int);
  */
 static inline int blk_do_io_stat(struct request *rq)
 {
-	return rq->rq_disk &&
-	       (rq->rq_flags & RQF_IO_STAT) &&
-		!blk_rq_is_passthrough(rq);
+	return false;
 }
 
 static inline void req_set_nomerge(struct request_queue *q, struct request *req)
