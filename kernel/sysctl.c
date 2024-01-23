@@ -61,12 +61,13 @@
 #include <linux/kmod.h>
 #include <linux/capability.h>
 #include <linux/binfmts.h>
+#include <linux/sched.h>
 #include <linux/sched/sysctl.h>
 #include <linux/sched/coredump.h>
 #include <linux/kexec.h>
 #include <linux/bpf.h>
 #include <linux/mount.h>
-
+#include <linux/battery_saver.h>
 #include <linux/uaccess.h>
 #include <asm/processor.h>
 
@@ -119,23 +120,34 @@ extern int sysctl_nr_trim_pages;
 static int sixty = 60;
 #endif
 
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+static int boost_slot_ta;
+static int boost_slot_fg;
+#endif
+
 static int __maybe_unused neg_one = -1;
+static int __maybe_unused neg_three = -3;
 
 static int zero;
 static int __maybe_unused one = 1;
 static int __maybe_unused two = 2;
+static int __maybe_unused three = 3;
 static int __maybe_unused four = 4;
 static unsigned long zero_ul;
 static unsigned long one_ul = 1;
 static unsigned long long_max = LONG_MAX;
 static int one_hundred = 100;
 static int one_thousand = 1000;
+#ifdef CONFIG_SCHED_WALT
+static int two_million = 2000000;
+#endif
 #ifdef CONFIG_PRINTK
 static int ten_thousand = 10000;
 #endif
 #ifdef CONFIG_PERF_EVENTS
 static int six_hundred_forty_kb = 640 * 1024;
 #endif
+static int two_hundred_fifty_five = 255;
 
 /* this is needed for the proc_doulongvec_minmax of vm_dirty_bytes */
 static unsigned long dirty_bytes_min = 2 * PAGE_SIZE;
@@ -207,6 +219,11 @@ static int proc_do_cad_pid(struct ctl_table *table, int write,
 		  void __user *buffer, size_t *lenp, loff_t *ppos);
 static int proc_taint(struct ctl_table *table, int write,
 			       void __user *buffer, size_t *lenp, loff_t *ppos);
+#ifdef CONFIG_COMPACTION
+static int proc_dointvec_minmax_warn_RT_change(struct ctl_table *table,
+					       int write, void __user *buffer,
+					       size_t *lenp, loff_t *ppos);
+#endif
 #endif
 
 #ifdef CONFIG_PRINTK
@@ -318,16 +335,20 @@ static struct ctl_table sysctl_base_table[] = {
 	{ }
 };
 
-#ifdef CONFIG_SCHED_DEBUG
 static int min_sched_granularity_ns = 100000;		/* 100 usecs */
 static int max_sched_granularity_ns = NSEC_PER_SEC;	/* 1 second */
+#ifdef CONFIG_SCHED_DEBUG
 static int min_wakeup_granularity_ns;			/* 0 usecs */
 static int max_wakeup_granularity_ns = NSEC_PER_SEC;	/* 1 second */
+#endif
 #ifdef CONFIG_SMP
 static int min_sched_tunable_scaling = SCHED_TUNABLESCALING_NONE;
 static int max_sched_tunable_scaling = SCHED_TUNABLESCALING_END-1;
 #endif /* CONFIG_SMP */
-#endif /* CONFIG_SCHED_DEBUG */
+
+#ifndef CONFIG_SCHED_WALT
+static int sysctl_sched_boost = 0;
+#endif
 
 #ifdef CONFIG_COMPACTION
 static int min_extfrag_threshold;
@@ -335,84 +356,132 @@ static int max_extfrag_threshold = 1000;
 #endif
 
 static struct ctl_table kern_table[] = {
+#if defined(CONFIG_PREEMPT_TRACER) || defined(CONFIG_DEBUG_PREEMPT)
 	{
-		.procname	= "sched_child_runs_first",
-		.data		= &sysctl_sched_child_runs_first,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.procname       = "preemptoff_tracing_threshold_ns",
+		.data           = &sysctl_preemptoff_tracing_threshold_ns,
+		.maxlen         = sizeof(unsigned int),
+		.mode           = 0644,
+		.proc_handler   = proc_dointvec,
 	},
-#ifdef CONFIG_SCHED_DEBUG
+#endif
+#if defined(CONFIG_IRQSOFF_TRACER) && defined(CONFIG_PREEMPTIRQ_EVENTS)
 	{
-		.procname	= "sched_min_granularity_ns",
-		.data		= &sysctl_sched_min_granularity,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= sched_proc_update_handler,
-		.extra1		= &min_sched_granularity_ns,
-		.extra2		= &max_sched_granularity_ns,
+		.procname       = "irqsoff_tracing_threshold_ns",
+		.data           = &sysctl_irqsoff_tracing_threshold_ns,
+		.maxlen         = sizeof(unsigned int),
+		.mode           = 0644,
+		.proc_handler   = proc_dointvec,
 	},
-	{
-		.procname	= "sched_latency_ns",
-		.data		= &sysctl_sched_latency,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= sched_proc_update_handler,
-		.extra1		= &min_sched_granularity_ns,
-		.extra2		= &max_sched_granularity_ns,
-	},
+#endif
 #ifdef CONFIG_SCHED_WALT
 	{
-		.procname	= "sched_use_walt_cpu_util",
-		.data		= &sysctl_sched_use_walt_cpu_util,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.procname       = "sched_cpu_high_irqload",
+		.data           = &sysctl_sched_cpu_high_irqload,
+		.maxlen         = sizeof(unsigned int),
+		.mode           = 0644,
+		.proc_handler   = proc_dointvec,
 	},
 	{
-		.procname	= "sched_use_walt_task_util",
-		.data		= &sysctl_sched_use_walt_task_util,
+		.procname	= "sched_group_upmigrate",
+		.data		= &sysctl_sched_group_upmigrate_pct,
 		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.proc_handler	= walt_proc_update_handler,
+		.extra1		= &sysctl_sched_group_downmigrate_pct,
 	},
 	{
-		.procname	= "sched_walt_init_task_load_pct",
-		.data		= &sysctl_sched_walt_init_task_load_pct,
+		.procname	= "sched_group_downmigrate",
+		.data		= &sysctl_sched_group_downmigrate_pct,
 		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.proc_handler	= walt_proc_update_handler,
+		.extra1		= &zero,
+		.extra2		= &sysctl_sched_group_upmigrate_pct,
 	},
 	{
-		.procname	= "sched_walt_cpu_high_irqload",
-		.data		= &sysctl_sched_walt_cpu_high_irqload,
+		.procname	= "sched_boost",
+		.data		= &sysctl_sched_boost,
 		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.proc_handler	= sched_boost_handler,
+		.extra1		= &neg_three,
+		.extra2		= &three,
+	},
+	{
+		.procname	= "sched_walt_rotate_big_tasks",
+		.data		= &sysctl_sched_walt_rotate_big_tasks,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+	{
+		.procname	= "sched_min_task_util_for_boost",
+		.data		= &sysctl_sched_min_task_util_for_boost,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one_thousand,
+	},
+	{
+		.procname	= "sched_min_task_util_for_colocation",
+		.data		= &sysctl_sched_min_task_util_for_colocation,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one_thousand,
+	},
+	{
+		.procname	= "sched_little_cluster_coloc_fmin_khz",
+		.data		= &sysctl_sched_little_cluster_coloc_fmin_khz,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= sched_little_cluster_coloc_fmin_khz_handler,
+		.extra1		= &zero,
+		.extra2		= &two_million,
+	},
+#else
+	{
+		.procname	= "sched_boost",
+		.data		= &sysctl_sched_boost,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= sched_boost_handler,
+		.extra1		= &neg_three,
+		.extra2		= &three,
 	},
 #endif
 	{
-		.procname	= "sched_sync_hint_enable",
-		.data		= &sysctl_sched_sync_hint_enable,
-		.maxlen		= sizeof(unsigned int),
+		.procname	= "sched_upmigrate",
+		.data		= &sysctl_sched_capacity_margin_up,
+		.maxlen		= sizeof(unsigned int) * MAX_MARGIN_LEVELS,
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.proc_handler	= sched_updown_migrate_handler,
 	},
 	{
-		.procname	= "sched_cstate_aware",
-		.data		= &sysctl_sched_cstate_aware,
-		.maxlen		= sizeof(unsigned int),
+		.procname	= "sched_downmigrate",
+		.data		= &sysctl_sched_capacity_margin_down,
+		.maxlen		= sizeof(unsigned int) * MAX_MARGIN_LEVELS,
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.proc_handler	= sched_updown_migrate_handler,
 	},
 	{
-		.procname	= "sched_wakeup_granularity_ns",
-		.data		= &sysctl_sched_wakeup_granularity,
-		.maxlen		= sizeof(unsigned int),
+		.procname	= "sched_upmigrate_boosted",
+		.data		= &sysctl_sched_capacity_margin_up_boosted,
+		.maxlen		= sizeof(unsigned int) * MAX_MARGIN_LEVELS,
 		.mode		= 0644,
-		.proc_handler	= sched_proc_update_handler,
-		.extra1		= &min_wakeup_granularity_ns,
-		.extra2		= &max_wakeup_granularity_ns,
+		.proc_handler	= sched_updown_migrate_handler_boosted,
+	},
+	{
+		.procname	= "sched_downmigrate_boosted",
+		.data		= &sysctl_sched_capacity_margin_down_boosted,
+		.maxlen		= sizeof(unsigned int) * MAX_MARGIN_LEVELS,
+		.mode		= 0644,
+		.proc_handler	= sched_updown_migrate_handler_boosted,
 	},
 #ifdef CONFIG_SMP
 	{
@@ -431,6 +500,57 @@ static struct ctl_table kern_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
 	},
+#endif
+#ifdef CONFIG_SCHED_DEBUG
+	{
+		.procname	= "sched_latency_ns",
+		.data		= &sysctl_sched_latency,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= sched_proc_update_handler,
+		.extra1		= &min_sched_granularity_ns,
+		.extra2		= &max_sched_granularity_ns,
+	},
+	{
+		.procname	= "sched_child_runs_first",
+		.data		= &sysctl_sched_child_runs_first,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "sched_min_granularity_ns",
+		.data		= &sysctl_sched_min_granularity,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= sched_proc_update_handler,
+		.extra1		= &min_sched_granularity_ns,
+		.extra2		= &max_sched_granularity_ns,
+	},
+	{
+		.procname	= "sched_wakeup_granularity_ns",
+		.data		= &sysctl_sched_wakeup_granularity,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= sched_proc_update_handler,
+		.extra1		= &min_wakeup_granularity_ns,
+		.extra2		= &max_wakeup_granularity_ns,
+	},
+	{
+		.procname	= "sched_sync_hint_enable",
+		.data		= &sysctl_sched_sync_hint_enable,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "sched_cstate_aware",
+		.data		= &sysctl_sched_cstate_aware,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+#ifdef CONFIG_SMP
 	{
 		.procname	= "sched_nr_migrate",
 		.data		= &sysctl_sched_nr_migrate,
@@ -541,6 +661,22 @@ static struct ctl_table kern_table[] = {
 		.extra1		= &one,
 	},
 #endif
+	{
+		.procname	= "sched_lib_name",
+		.data		= sched_lib_name,
+		.maxlen		= LIB_PATH_LENGTH,
+		.mode		= 0644,
+		.proc_handler	= proc_dostring,
+	},
+	{
+		.procname	= "sched_lib_mask_force",
+		.data		= &sched_lib_mask_force,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &two_hundred_fifty_five,
+	},
 #ifdef CONFIG_PROVE_LOCKING
 	{
 		.procname	= "prove_locking",
@@ -1169,6 +1305,16 @@ static struct ctl_table kern_table[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= &neg_one,
 	},
+	{
+		.procname	= "hung_task_selective_monitoring",
+		.data		= &sysctl_hung_task_selective_monitoring,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+
 #endif
 #ifdef CONFIG_RT_MUTEXES
 	{
@@ -1292,6 +1438,23 @@ static struct ctl_table kern_table[] = {
 		.extra2		= &one,
 	},
 #endif
+#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
+	{
+		.procname	= "boot_reason",
+		.data		= &boot_reason,
+		.maxlen		= sizeof(int),
+		.mode		= 0444,
+		.proc_handler	= proc_dointvec,
+	},
+
+	{
+		.procname	= "cold_boot",
+		.data		= &cold_boot,
+		.maxlen		= sizeof(int),
+		.mode		= 0444,
+		.proc_handler	= proc_dointvec,
+	},
+#endif
 	{ }
 };
 
@@ -1327,6 +1490,13 @@ static struct ctl_table vm_table[] = {
 		.maxlen		= sizeof(sysctl_oom_dump_tasks),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname       = "reap_mem_on_sigkill",
+		.data           = &sysctl_reap_mem_on_sigkill,
+		.maxlen         = sizeof(sysctl_reap_mem_on_sigkill),
+		.mode           = 0644,
+		.proc_handler   = proc_dointvec,
 	},
 	{
 		.procname	= "overcommit_ratio",
@@ -1421,6 +1591,15 @@ static struct ctl_table vm_table[] = {
 		.extra1		= &zero,
 		.extra2		= &one_hundred,
 	},
+	{
+		.procname       = "want_old_faultaround_pte",
+		.data           = &want_old_faultaround_pte,
+		.maxlen         = sizeof(want_old_faultaround_pte),
+		.mode           = 0644,
+		.proc_handler   = proc_dointvec_minmax,
+		.extra1         = &zero,
+		.extra2         = &one,
+	},
 #ifdef CONFIG_HUGETLB_PAGE
 	{
 		.procname	= "nr_hugepages",
@@ -1498,7 +1677,7 @@ static struct ctl_table vm_table[] = {
 		.data		= &sysctl_compact_unevictable_allowed,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.proc_handler	= proc_dointvec_minmax_warn_RT_change,
 		.extra1		= &zero,
 		.extra2		= &one,
 	},
@@ -1732,6 +1911,22 @@ static struct ctl_table vm_table[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= (void *)&mmap_rnd_compat_bits_min,
 		.extra2		= (void *)&mmap_rnd_compat_bits_max,
+	},
+#endif
+#ifdef CONFIG_SWAP
+	{
+		.procname	= "swap_ratio",
+		.data		= &sysctl_swap_ratio,
+		.maxlen		= sizeof(sysctl_swap_ratio),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+	},
+	{
+		.procname	= "swap_ratio_enable",
+		.data		= &sysctl_swap_ratio_enable,
+		.maxlen		= sizeof(sysctl_swap_ratio_enable),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
 	},
 #endif
 	{ }
@@ -2539,6 +2734,28 @@ int proc_dointvec(struct ctl_table *table, int write,
 	return do_proc_dointvec(table, write, buffer, lenp, ppos, NULL, NULL);
 }
 
+#ifdef CONFIG_COMPACTION
+static int proc_dointvec_minmax_warn_RT_change(struct ctl_table *table,
+					       int write, void __user *buffer,
+					       size_t *lenp, loff_t *ppos)
+{
+	int ret, old;
+
+	if (!IS_ENABLED(CONFIG_PREEMPT_RT) || !write)
+		return proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+
+	old = *(int *)table->data;
+	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (ret)
+		return ret;
+	if (old != *(int *)table->data)
+		pr_warn_once("sysctl attribute %s changed by %s[%d]\n",
+			     table->procname, current->comm,
+			     task_pid_nr(current));
+	return ret;
+}
+#endif
+
 /**
  * proc_douintvec - read a vector of unsigned integers
  * @table: the sysctl table
@@ -3206,6 +3423,78 @@ int proc_do_large_bitmap(struct ctl_table *table, int write,
 	}
 }
 
+static int do_proc_douintvec_capacity_conv(bool *negp, unsigned long *lvalp,
+					   int *valp, int write, void *data)
+{
+	if (write) {
+		/*
+		 * The sched_upmigrate/sched_downmigrate tunables are
+		 * accepted in percentage. Limit them to 100.
+		 */
+		if (*negp || *lvalp == 0 || *lvalp > 100)
+			return -EINVAL;
+		*valp = SCHED_FIXEDPOINT_SCALE * 100 / *lvalp;
+	} else {
+		*negp = false;
+		*lvalp = SCHED_FIXEDPOINT_SCALE * 100 / *valp;
+	}
+
+	return 0;
+}
+
+/**
+ * proc_douintvec_capacity - read a vector of integers in percentage and convert
+ *			    into sched capacity
+ * @table: the sysctl table
+ * @write: %TRUE if this is a write to the sysctl file
+ * @buffer: the user buffer
+ * @lenp: the size of the user buffer
+ * @ppos: file position
+ *
+ * Returns 0 on success.
+ */
+int proc_douintvec_capacity(struct ctl_table *table, int write,
+			    void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	return do_proc_dointvec(table, write, buffer, lenp, ppos,
+				do_proc_douintvec_capacity_conv, NULL);
+}
+
+#ifndef CONFIG_SCHED_WALT
+int sched_boost_handler(struct ctl_table *table, int write,
+		void __user *buffer, size_t *lenp,
+		loff_t *ppos)
+{
+	int ret;
+	unsigned int *data = (unsigned int *)table->data;
+
+	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+
+	if (ret || !write)
+		return ret;
+
+	pr_debug("%s set sb to %i\n", current->comm, *data);
+
+#ifdef CONFIG_DYNAMIC_STUNE_BOOST
+	if (is_battery_saver_on())
+		return ret;
+
+	if (*data == 1) {
+		do_stune_boost("top-app", 20, &boost_slot_ta);
+		do_stune_boost("foreground", 5, &boost_slot_fg);
+	} else if (*data == 3) {
+		do_stune_boost("top-app", 10, &boost_slot_ta);
+		do_stune_boost("foreground", 1, &boost_slot_fg);
+	} else {
+		reset_stune_boost("top-app", boost_slot_ta);
+		reset_stune_boost("foreground", boost_slot_fg);
+	}
+#endif
+
+	return ret;
+}
+#endif
+
 #else /* CONFIG_PROC_SYSCTL */
 
 int proc_dostring(struct ctl_table *table, int write,
@@ -3269,6 +3558,11 @@ int proc_doulongvec_ms_jiffies_minmax(struct ctl_table *table, int write,
     return -ENOSYS;
 }
 
+int proc_douintvec_capacity(struct ctl_table *table, int write,
+			    void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	return -ENOSYS;
+}
 
 #endif /* CONFIG_PROC_SYSCTL */
 

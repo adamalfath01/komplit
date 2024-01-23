@@ -42,6 +42,7 @@
 #include <linux/fs.h>
 #include <linux/trace.h>
 #include <linux/sched/rt.h>
+#include <linux/coresight-stm.h>
 
 #include "trace.h"
 #include "trace_output.h"
@@ -1686,7 +1687,7 @@ void tracing_reset(struct trace_buffer *buf, int cpu)
 	ring_buffer_record_disable(buffer);
 
 	/* Make sure all commits have finished */
-	synchronize_sched();
+	synchronize_rcu();
 	ring_buffer_reset_cpu(buffer, cpu);
 
 	ring_buffer_record_enable(buffer);
@@ -1703,7 +1704,7 @@ void tracing_reset_online_cpus(struct trace_buffer *buf)
 	ring_buffer_record_disable(buffer);
 
 	/* Make sure all commits have finished */
-	synchronize_sched();
+	synchronize_rcu();
 
 	buf->time_start = buffer_ftrace_now(buf, buf->cpu);
 
@@ -2262,7 +2263,7 @@ void trace_buffered_event_disable(void)
 	preempt_enable();
 
 	/* Wait for all current users to finish */
-	synchronize_sched();
+	synchronize_rcu();
 
 	for_each_tracing_cpu(cpu) {
 		free_page((unsigned long)per_cpu(trace_buffered_event, cpu));
@@ -2388,14 +2389,15 @@ int tracepoint_printk_sysctl(struct ctl_table *table, int write,
 	return ret;
 }
 
-void trace_event_buffer_commit(struct trace_event_buffer *fbuffer)
+void trace_event_buffer_commit(struct trace_event_buffer *fbuffer,
+			       unsigned long len)
 {
 	if (static_key_false(&tracepoint_printk_key.key))
 		output_printk(fbuffer);
 
 	event_trigger_unlock_commit(fbuffer->trace_file, fbuffer->buffer,
 				    fbuffer->event, fbuffer->entry,
-				    fbuffer->flags, fbuffer->pc);
+				    fbuffer->flags, fbuffer->pc, len);
 }
 EXPORT_SYMBOL_GPL(trace_event_buffer_commit);
 
@@ -2708,17 +2710,6 @@ void __trace_stack(struct trace_array *tr, unsigned long flags, int skip,
 	if (unlikely(in_nmi()))
 		return;
 
-	/*
-	 * It is possible that a function is being traced in a
-	 * location that RCU is not watching. A call to
-	 * rcu_irq_enter() will make sure that it is, but there's
-	 * a few internal rcu functions that could be traced
-	 * where that wont work either. In those cases, we just
-	 * do nothing.
-	 */
-	if (unlikely(rcu_irq_enter_disabled()))
-		return;
-
 	rcu_irq_enter_irqson();
 	__ftrace_trace_stack(buffer, flags, skip, pc, NULL);
 	rcu_irq_exit_irqson();
@@ -2964,6 +2955,9 @@ int trace_vbprintk(unsigned long ip, const char *fmt, va_list args)
 
 	memcpy(entry->buf, tbuffer, sizeof(u32) * len);
 	if (!call_filter_check_discard(call, entry, buffer, event)) {
+		len = vscnprintf(tbuffer, TRACE_BUF_SIZE, fmt, args);
+		stm_log(OST_ENTITY_TRACE_PRINTK, tbuffer, len+1);
+
 		__buffer_unlock_commit(buffer, event);
 		ftrace_trace_stack(tr, buffer, flags, 6, pc, NULL);
 	}
@@ -3020,6 +3014,7 @@ __trace_array_vprintk(struct ring_buffer *buffer,
 
 	memcpy(&entry->buf, tbuffer, len + 1);
 	if (!call_filter_check_discard(call, entry, buffer, event)) {
+		stm_log(OST_ENTITY_TRACE_PRINTK, entry->buf, len + 1);
 		__buffer_unlock_commit(buffer, event);
 		ftrace_trace_stack(&global_trace, buffer, flags, 6, pc, NULL);
 	}
@@ -5427,7 +5422,7 @@ static int tracing_set_tracer(struct trace_array *tr, const char *buf)
 	if (tr->current_trace->reset)
 		tr->current_trace->reset(tr);
 
-	/* Current trace needs to be nop_trace before synchronize_sched */
+	/* Current trace needs to be nop_trace before synchronize_rcu */
 	tr->current_trace = &nop_trace;
 
 #ifdef CONFIG_TRACER_MAX_TRACE
@@ -5441,7 +5436,7 @@ static int tracing_set_tracer(struct trace_array *tr, const char *buf)
 		 * The update_max_tr is called from interrupts disabled
 		 * so a synchronized_sched() is sufficient.
 		 */
-		synchronize_sched();
+		synchronize_rcu();
 		free_snapshot(tr);
 	}
 #endif
@@ -6114,6 +6109,7 @@ tracing_mark_write(struct file *filp, const char __user *ubuf,
 {
 	struct trace_array *tr = filp->private_data;
 	struct ring_buffer_event *event;
+	struct trace_entry *trace_entry;
 	struct ring_buffer *buffer;
 	struct print_entry *entry;
 	unsigned long irq_flags;
@@ -6151,7 +6147,8 @@ tracing_mark_write(struct file *filp, const char __user *ubuf,
 		return -EBADF;
 
 	entry = ring_buffer_event_data(event);
-	entry->ip = _THIS_IP_;
+	trace_entry = (struct trace_entry *)entry;
+	entry->ip = trace_entry->pid;
 
 	len = __copy_from_user_inatomic(&entry->buf, ubuf, cnt);
 	if (len) {
@@ -6165,9 +6162,12 @@ tracing_mark_write(struct file *filp, const char __user *ubuf,
 	if (entry->buf[cnt - 1] != '\n') {
 		entry->buf[cnt] = '\n';
 		entry->buf[cnt + 1] = '\0';
-	} else
+		stm_log(OST_ENTITY_TRACE_MARKER, entry, sizeof(*entry)+cnt + 2);
+	} else {
 		entry->buf[cnt] = '\0';
-
+		stm_log(OST_ENTITY_TRACE_MARKER, entry, sizeof(*entry)+cnt + 1);
+	}
+	entry->ip = _THIS_IP_;
 	__buffer_unlock_commit(buffer, event);
 
 	if (written > 0)

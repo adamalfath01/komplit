@@ -262,7 +262,7 @@ void rq_attach_root(struct rq *rq, struct root_domain *rd)
 	raw_spin_unlock_irqrestore(&rq->lock, flags);
 
 	if (old_rd)
-		call_rcu_sched(&old_rd->rcu, free_rootdomain);
+		call_rcu(&old_rd->rcu, free_rootdomain);
 }
 
 void sched_get_rd(struct root_domain *rd)
@@ -275,7 +275,7 @@ void sched_put_rd(struct root_domain *rd)
 	if (!atomic_dec_and_test(&rd->refcount))
 		return;
 
-	call_rcu_sched(&rd->rcu, free_rootdomain);
+	call_rcu(&rd->rcu, free_rootdomain);
 }
 
 static int init_rootdomain(struct root_domain *rd)
@@ -303,6 +303,7 @@ static int init_rootdomain(struct root_domain *rd)
 		goto free_cpudl;
 
 	rd->max_cap_orig_cpu = rd->min_cap_orig_cpu = -1;
+	rd->mid_cap_orig_cpu = -1;
 
 	init_max_cpu_capacity(&rd->max_cpu_capacity);
 
@@ -416,7 +417,8 @@ DEFINE_PER_CPU(int, sd_llc_size);
 DEFINE_PER_CPU(int, sd_llc_id);
 DEFINE_PER_CPU(struct sched_domain_shared *, sd_llc_shared);
 DEFINE_PER_CPU(struct sched_domain *, sd_numa);
-DEFINE_PER_CPU(struct sched_domain *, sd_asym);
+DEFINE_PER_CPU(struct sched_domain *, sd_asym_packing);
+DEFINE_PER_CPU(struct sched_domain *, sd_asym_cpucapacity);
 DEFINE_PER_CPU(struct sched_domain *, sd_ea);
 DEFINE_PER_CPU(struct sched_domain *, sd_scs);
 DEFINE_STATIC_KEY_FALSE(sched_asym_cpucapacity);
@@ -445,7 +447,10 @@ static void update_top_cache_domain(int cpu)
 	rcu_assign_pointer(per_cpu(sd_numa, cpu), sd);
 
 	sd = highest_flag_domain(cpu, SD_ASYM_PACKING);
-	rcu_assign_pointer(per_cpu(sd_asym, cpu), sd);
+	rcu_assign_pointer(per_cpu(sd_asym_packing, cpu), sd);
+
+	sd = lowest_flag_domain(cpu, SD_ASYM_CPUCAPACITY);
+	rcu_assign_pointer(per_cpu(sd_asym_cpucapacity, cpu), sd);
 
 	for_each_domain(cpu, sd) {
 		if (sd->groups->sge)
@@ -895,6 +900,7 @@ static struct sched_group *get_group(int cpu, struct sd_data *sdd)
 	struct sched_domain *sd = *per_cpu_ptr(sdd->sd, cpu);
 	struct sched_domain *child = sd->child;
 	struct sched_group *sg;
+	bool already_visited;
 
 	if (child)
 		cpu = cpumask_first(sched_domain_span(child));
@@ -902,9 +908,14 @@ static struct sched_group *get_group(int cpu, struct sd_data *sdd)
 	sg = *per_cpu_ptr(sdd->sg, cpu);
 	sg->sgc = *per_cpu_ptr(sdd->sgc, cpu);
 
-	/* For claim_allocations: */
-	atomic_inc(&sg->ref);
-	atomic_inc(&sg->sgc->ref);
+	/* Increase refcounts for claim_allocations: */
+	already_visited = atomic_inc_return(&sg->ref) > 1;
+	/* sgc visits should follow a similar trend as sg */
+	WARN_ON(already_visited != (atomic_inc_return(&sg->sgc->ref) > 1));
+
+	/* If we have already visited that group, it's already initialized. */
+	if (already_visited)
+		return sg;
 
 	if (child) {
 		cpumask_copy(sched_group_span(sg), sched_domain_span(child));
@@ -974,16 +985,19 @@ build_sched_groups(struct sched_domain *sd, int cpu)
  * group having more cpu_capacity will pickup more load compared to the
  * group having less cpu_capacity.
  */
-static void init_sched_groups_capacity(int cpu, struct sched_domain *sd)
+void init_sched_groups_capacity(int cpu, struct sched_domain *sd)
 {
 	struct sched_group *sg = sd->groups;
+	cpumask_t avail_mask;
 
 	WARN_ON(!sg);
 
 	do {
 		int cpu, max_cpu = -1;
 
-		sg->group_weight = cpumask_weight(sched_group_span(sg));
+		cpumask_andnot(&avail_mask, sched_group_span(sg),
+							cpu_isolated_mask);
+		sg->group_weight = cpumask_weight(&avail_mask);
 
 		if (!(sd->flags & SD_ASYM_PACKING))
 			goto next;
@@ -1096,11 +1110,11 @@ static void init_sched_groups_energy(int cpu, struct sched_domain *sd,
 		if (energy_eff(sge, i) > energy_eff(sge, i+1))
 			continue;
 #ifdef CONFIG_SCHED_DEBUG
-		pr_warn("WARN: cpu=%d, domain=%s: incr. energy eff %lu[%d]->%lu[%d]\n",
+		pr_debug("WARN: cpu=%d, domain=%s: incr. energy eff %lu[%d]->%lu[%d]\n",
 			cpu, sd->name, energy_eff(sge, i), i,
 			energy_eff(sge, i+1), i+1);
 #else
-		pr_warn("WARN: cpu=%d: incr. energy eff %lu[%d]->%lu[%d]\n",
+		pr_debug("WARN: cpu=%d: incr. energy eff %lu[%d]->%lu[%d]\n",
 			cpu, energy_eff(sge, i), i, energy_eff(sge, i+1), i+1);
 #endif
 	}
@@ -1876,16 +1890,42 @@ build_sched_domains(const struct cpumask *cpu_map, struct sched_domain_attr *att
 
 		sd = *per_cpu_ptr(d.sd, i);
 
-		if ((max_cpu < 0) || (cpu_rq(i)->cpu_capacity_orig >
-		    cpu_rq(max_cpu)->cpu_capacity_orig))
+		if ((max_cpu < 0) || (arch_scale_cpu_capacity(NULL, i) >
+				arch_scale_cpu_capacity(NULL, max_cpu)))
 			WRITE_ONCE(d.rd->max_cap_orig_cpu, i);
 
-		if ((min_cpu < 0) || (cpu_rq(i)->cpu_capacity_orig <
-		    cpu_rq(min_cpu)->cpu_capacity_orig))
+		if ((min_cpu < 0) || (arch_scale_cpu_capacity(NULL, i) <
+				arch_scale_cpu_capacity(NULL, min_cpu)))
 			WRITE_ONCE(d.rd->min_cap_orig_cpu, i);
 
 		cpu_attach_domain(sd, d.rd, i);
 	}
+
+	/* set the mid capacity cpu (assumes only 3 capacities) */
+	for_each_cpu(i, cpu_map) {
+		int max_cpu = READ_ONCE(d.rd->max_cap_orig_cpu);
+		int min_cpu = READ_ONCE(d.rd->min_cap_orig_cpu);
+
+		if ((arch_scale_cpu_capacity(NULL, i)
+				!=  arch_scale_cpu_capacity(NULL, min_cpu)) &&
+				(arch_scale_cpu_capacity(NULL, i)
+				!=  arch_scale_cpu_capacity(NULL, max_cpu))) {
+			WRITE_ONCE(d.rd->mid_cap_orig_cpu, i);
+			break;
+		}
+	}
+
+	/*
+	 * The max_cpu_capacity reflect the original capacity which does not
+	 * change dynamically. So update the max cap CPU and its capacity
+	 * here.
+	 */
+	if (d.rd->max_cap_orig_cpu != -1) {
+		d.rd->max_cpu_capacity.cpu = d.rd->max_cap_orig_cpu;
+		d.rd->max_cpu_capacity.val = arch_scale_cpu_capacity(NULL,
+						d.rd->max_cap_orig_cpu);
+	}
+
 	rcu_read_unlock();
 
 	if (!cpumask_empty(cpu_map))

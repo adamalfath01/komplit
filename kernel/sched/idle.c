@@ -109,7 +109,7 @@ static int call_cpuidle(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 	 * update no idle residency and return.
 	 */
 	if (current_clr_polling_and_test()) {
-		dev->last_residency = 0;
+		dev->last_residency_ns = 0;
 		local_irq_enable();
 		return -EBUSY;
 	}
@@ -229,6 +229,8 @@ exit_idle:
  */
 static void do_idle(void)
 {
+	int cpu = smp_processor_id();
+
 	/*
 	 * If the arch has a polling bit, we maintain an invariant:
 	 *
@@ -239,20 +241,20 @@ static void do_idle(void)
 	 */
 
 	__current_set_polling();
-	quiet_vmstat();
 	tick_nohz_idle_enter();
 
 	while (!need_resched()) {
 		check_pgt_cache();
 		rmb();
 
-		if (cpu_is_offline(smp_processor_id())) {
-			tick_nohz_idle_stop_tick_protected();
+		local_irq_disable();
+
+		if (cpu_is_offline(cpu)) {
+			tick_nohz_idle_stop_tick();
 			cpuhp_report_idle_dead();
 			arch_cpu_idle_dead();
 		}
 
-		local_irq_disable();
 		arch_cpu_idle_enter();
 
 		/*

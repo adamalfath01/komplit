@@ -27,6 +27,7 @@
 #include <linux/posix-timers.h>
 #include <linux/workqueue.h>
 #include <linux/freezer.h>
+#include <linux/delay.h>
 #include <linux/compat.h>
 #include <linux/module.h>
 
@@ -65,6 +66,19 @@ static struct rtc_timer		rtctimer;
 static struct rtc_device	*rtcdev;
 static DEFINE_SPINLOCK(rtcdev_lock);
 
+static void alarmtimer_triggered_func(void *p)
+{
+	struct rtc_device *rtc = rtcdev;
+
+	if (!(rtc->irq_data & RTC_AF))
+		return;
+	__pm_wakeup_event(ws, MSEC_PER_SEC / 2);
+}
+
+static struct rtc_task alarmtimer_rtc_task = {
+	.func = alarmtimer_triggered_func
+};
+
 /**
  * alarmtimer_get_rtcdev - Return selected rtcdevice
  *
@@ -75,7 +89,7 @@ static DEFINE_SPINLOCK(rtcdev_lock);
 struct rtc_device *alarmtimer_get_rtcdev(void)
 {
 	unsigned long flags;
-	struct rtc_device *ret;
+	struct rtc_device *ret = NULL;
 
 	spin_lock_irqsave(&rtcdev_lock, flags);
 	ret = rtcdev;
@@ -98,8 +112,6 @@ static int alarmtimer_rtc_add_device(struct device *dev,
 
 	if (!rtc->ops->set_alarm)
 		return -1;
-	if (!device_may_wakeup(rtc->dev.parent))
-		return -1;
 
 	__ws = wakeup_source_register("alarmtimer");
 
@@ -109,6 +121,10 @@ static int alarmtimer_rtc_add_device(struct device *dev,
 			ret = -1;
 			goto unlock;
 		}
+
+		ret = rtc_irq_register(rtc, &alarmtimer_rtc_task);
+		if (ret)
+			goto unlock;
 
 		rtcdev = rtc;
 		/* hold a reference so it doesn't go away */
@@ -124,6 +140,15 @@ unlock:
 	return ret;
 }
 
+static void alarmtimer_rtc_remove_device(struct device *dev,
+				struct class_interface *class_intf)
+{
+	if (rtcdev && dev == &rtcdev->dev) {
+		rtc_irq_unregister(rtcdev, &alarmtimer_rtc_task);
+		rtcdev = NULL;
+	}
+}
+
 static inline void alarmtimer_rtc_timer_init(void)
 {
 	rtc_timer_init(&rtctimer, NULL, NULL);
@@ -131,6 +156,7 @@ static inline void alarmtimer_rtc_timer_init(void)
 
 static struct class_interface alarmtimer_rtc_interface = {
 	.add_dev = &alarmtimer_rtc_add_device,
+	.remove_dev = &alarmtimer_rtc_remove_device,
 };
 
 static int alarmtimer_rtc_interface_setup(void)
@@ -286,10 +312,8 @@ static int alarmtimer_suspend(struct device *dev)
 	if (min == 0)
 		return 0;
 
-	if (ktime_to_ns(min) < 2 * NSEC_PER_SEC) {
-		__pm_wakeup_event(ws, 2 * MSEC_PER_SEC);
-		return -EBUSY;
-	}
+	if (ktime_to_ns(min) < NSEC_PER_SEC / 2)
+		__pm_wakeup_event(ws, MSEC_PER_SEC / 2);
 
 	trace_alarmtimer_suspend(expires, type);
 
@@ -302,7 +326,7 @@ static int alarmtimer_suspend(struct device *dev)
 	/* Set alarm, if in the past reject suspend briefly to handle */
 	ret = rtc_timer_start(rtc, &rtctimer, now, 0);
 	if (ret < 0)
-		__pm_wakeup_event(ws, MSEC_PER_SEC);
+		__pm_wakeup_event(ws, MSEC_PER_SEC / 2);
 	return ret;
 }
 
@@ -439,6 +463,7 @@ int alarm_cancel(struct alarm *alarm)
 		if (ret >= 0)
 			return ret;
 		cpu_relax();
+		ndelay(TIMER_LOCK_TIGHT_LOOP_DELAY_NS);
 	}
 }
 EXPORT_SYMBOL_GPL(alarm_cancel);

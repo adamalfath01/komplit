@@ -26,13 +26,20 @@
 #include <linux/module.h>
 #include <linux/irq_work.h>
 #include <linux/posix-timers.h>
+#include <linux/timer.h>
 #include <linux/context_tracking.h>
+#include <linux/rq_stats.h>
+#include <linux/mm.h>
 
 #include <asm/irq_regs.h>
 
 #include "tick-internal.h"
 
 #include <trace/events/timer.h>
+
+struct rq_data rq_info;
+struct workqueue_struct *rq_wq;
+spinlock_t rq_lock;
 
 /*
  * Per-CPU nohz control structure
@@ -202,7 +209,7 @@ static bool check_tick_dependency(atomic_t *dep)
 
 static bool can_stop_full_tick(int cpu, struct tick_sched *ts)
 {
-	WARN_ON_ONCE(!irqs_disabled());
+	lockdep_assert_irqs_disabled();
 
 	if (unlikely(!cpu_online(cpu)))
 		return false;
@@ -817,6 +824,7 @@ static void tick_nohz_stop_tick(struct tick_sched *ts, int cpu)
 	if (!ts->tick_stopped) {
 		calc_load_nohz_start();
 		cpu_load_update_nohz_start();
+		quiet_vmstat();
 
 		ts->last_tick = hrtimer_get_expires(&ts->sched_timer);
 		ts->tick_stopped = 1;
@@ -960,6 +968,11 @@ static void __tick_nohz_idle_stop_tick(struct tick_sched *ts)
 	ktime_t expires;
 	int cpu = smp_processor_id();
 
+#ifdef CONFIG_SMP
+	if (check_pending_deferrable_timers(cpu))
+		raise_softirq_irqoff(TIMER_SOFTIRQ);
+#endif
+
 	/*
 	 * If tick_nohz_get_sleep_length() ran tick_nohz_next_event(), the
 	 * tick timer expiration time is known already.
@@ -1019,8 +1032,7 @@ void tick_nohz_idle_enter(void)
 {
 	struct tick_sched *ts;
 
-	WARN_ON_ONCE(irqs_disabled());
-
+	lockdep_assert_irqs_enabled();
 	/*
 	 * Update the idle state in the scheduler domain hierarchy
 	 * when tick_nohz_stop_tick() is called from the idle loop.
@@ -1071,6 +1083,18 @@ bool tick_nohz_idle_got_tick(void)
 		return true;
 	}
 	return false;
+}
+
+/**
+ * tick_nohz_get_next_hrtimer - return the next expiration time for the hrtimer
+ * or the tick, whatever that expires first. Note that, if the tick has been
+ * stopped, it returns the next hrtimer.
+ *
+ * Called from power state control code with interrupts disabled
+ */
+ktime_t tick_nohz_get_next_hrtimer(void)
+{
+	return __this_cpu_read(tick_cpu_device.evtdev)->next_event;
 }
 
 /**
@@ -1301,6 +1325,17 @@ void tick_irq_enter(void)
  * High resolution timer specific code
  */
 #ifdef CONFIG_HIGH_RES_TIMERS
+static void wakeup_user(void)
+{
+	unsigned long jiffy_gap;
+
+	jiffy_gap = jiffies - rq_info.def_timer_last_jiffy;
+	if (jiffy_gap >= rq_info.def_timer_jiffies) {
+		rq_info.def_timer_last_jiffy = jiffies;
+		queue_work(rq_wq, &rq_info.def_timer_work);
+	}
+}
+
 /*
  * We rearm the timer until we get disabled by the idle code.
  * Called with interrupts disabled.
@@ -1321,8 +1356,16 @@ static enum hrtimer_restart tick_sched_timer(struct hrtimer *timer)
 	 * Do not call, when we are not in irq context and have
 	 * no valid regs pointer
 	 */
-	if (regs)
+	if (regs) {
 		tick_sched_handle(ts, regs);
+		if (rq_info.init == 1 &&
+				tick_do_timer_cpu == smp_processor_id()) {
+			/*
+			 * wakeup user if needed
+			 */
+			wakeup_user();
+		}
+	}
 	else
 		ts->next_tick = 0;
 
@@ -1437,4 +1480,9 @@ int tick_check_oneshot_change(int allow_nohz)
 
 	tick_nohz_switch_to_nohz();
 	return 0;
+}
+
+ktime_t *get_next_event_cpu(unsigned int cpu)
+{
+	return &(per_cpu(tick_cpu_device, cpu).evtdev->next_event);
 }

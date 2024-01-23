@@ -459,7 +459,7 @@ disable_trace_kprobe(struct trace_kprobe *tk, struct trace_event_file *file)
 		 * event_call related objects, which will be accessed in
 		 * the kprobe_trace_func/kretprobe_trace_func.
 		 */
-		synchronize_sched();
+		synchronize_rcu();
 		kfree(link);	/* Ignored if link == NULL */
 	}
 
@@ -1187,13 +1187,12 @@ static void
 kprobe_perf_func(struct trace_kprobe *tk, struct pt_regs *regs)
 {
 	struct trace_event_call *call = &tk->tp.call;
-	struct bpf_prog *prog = call->prog;
 	struct kprobe_trace_entry_head *entry;
 	struct hlist_head *head;
 	int size, __size, dsize;
 	int rctx;
 
-	if (prog && !trace_call_bpf(prog, regs))
+	if (bpf_prog_array_valid(call) && !trace_call_bpf(call, regs))
 		return;
 
 	head = this_cpu_ptr(call->perf_events);
@@ -1223,13 +1222,12 @@ kretprobe_perf_func(struct trace_kprobe *tk, struct kretprobe_instance *ri,
 		    struct pt_regs *regs)
 {
 	struct trace_event_call *call = &tk->tp.call;
-	struct bpf_prog *prog = call->prog;
 	struct kretprobe_trace_entry_head *entry;
 	struct hlist_head *head;
 	int size, __size, dsize;
 	int rctx;
 
-	if (prog && !trace_call_bpf(prog, regs))
+	if (bpf_prog_array_valid(call) && !trace_call_bpf(call, regs))
 		return;
 
 	head = this_cpu_ptr(call->perf_events);
