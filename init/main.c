@@ -88,12 +88,14 @@
 #include <linux/io.h>
 #include <linux/cache.h>
 #include <linux/rodata_test.h>
+#include <linux/jump_label.h>
 
 #include <asm/io.h>
 #include <asm/bugs.h>
 #include <asm/setup.h>
 #include <asm/sections.h>
 #include <asm/cacheflush.h>
+#include <soc/qcom/boot_stats.h>
 
 static int kernel_init(void *);
 
@@ -509,10 +511,13 @@ static void __init mm_init(void)
 	pti_init();
 }
 
+int fpsensor=1;
+
 asmlinkage __visible void __init start_kernel(void)
 {
 	char *command_line;
 	char *after_dashes;
+	char *p = NULL;
 
 	set_task_stack_end_magic(&init_task);
 	smp_setup_processor_id();
@@ -547,6 +552,17 @@ asmlinkage __visible void __init start_kernel(void)
 
 	build_all_zonelists(NULL);
 	page_alloc_init();
+
+	pr_notice("Kernel command line: %s\n", boot_command_line);
+
+	p = strstr(command_line, "androidboot.fpsensor=fpc");
+	if (p) {
+		pr_info("You have fpc scanner\n");
+		fpsensor = 1;//fpc fingerprint
+	} else {
+		pr_info("You have goodix scanner\n");
+		fpsensor = 2;//goodix fingerprint
+	}
 
 	pr_notice("Kernel command line: %s\n", boot_command_line);
 	/* parameters may set static keys */
@@ -687,6 +703,7 @@ asmlinkage __visible void __init start_kernel(void)
 	vfs_caches_init();
 	pagecache_init();
 	signals_init();
+	seq_file_init();
 	proc_root_init();
 	nsfs_init();
 	cpuset_init();
@@ -896,8 +913,11 @@ static void __init do_initcalls(void)
 {
 	int level;
 
-	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++)
+	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++) {
 		do_initcall_level(level);
+		/* finish all async calls before going into next level */
+		async_synchronize_full();
+	}
 }
 
 /*
@@ -1009,6 +1029,7 @@ static int __ref kernel_init(void *unused)
 	numa_default_policy();
 
 	rcu_end_inkernel_boot();
+	place_marker("M - DRIVER Kernel Boot Done");
 
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);
