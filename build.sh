@@ -37,13 +37,12 @@ fi
 CONFIG=vendor/ginkgo-perf_defconfig
 KERNEL_DIR=$(pwd)
 PARENT_DIR="$(dirname "$KERNEL_DIR")"
-KERN_IMG="/home/ryzen/out-meme/arch/arm64/boot/Image.gz-dtb"
-export KBUILD_BUILD_USER="EdwiinKJ"
-export KBUILD_BUILD_HOST="Ryuzenn"
-export PATH="/home/ryzen/toolchain/nusantaraclang12/bin:$PATH"
-export LD_LIBRARY_PATH="/home/ryzen/toolchain/nusantaraclang12/lib:$LD_LIBRARY_PATH"
-export KBUILD_COMPILER_STRING="$(/home/ryzen/toolchain/nusantaraclang12/bin/clang --version | head -n 1 | perl -pe 's/\((?:http|git).*?\)//gs' | sed -e 's/  */ /g' -e 's/[[:space:]]*$//' -e 's/^.*clang/clang/')"
-export out=/home/ryzen/out-meme
+export KBUILD_BUILD_USER="RoniW43"
+export KBUILD_BUILD_HOST="@ronisaja"
+export PATH="toolchain/nusantaraclang12/bin:$PATH"
+export LD_LIBRARY_PATH="toolchain/nusantaraclang12/lib:$LD_LIBRARY_PATH"
+export KBUILD_COMPILER_STRING="$(toolchain/nusantaraclang12/bin/clang --version | head -n 1 | perl -pe 's/\((?:http|git).*?\)//gs' | sed -e 's/  */ /g' -e 's/[[:space:]]*$//' -e 's/^.*clang/clang/')"
+export out=out
 
 # Functions
 clang_build () {
