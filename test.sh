@@ -21,6 +21,9 @@ else
     echo "${bold}Folder Toolchain Sudah Tersedia, Tidak Perlu Di Clone${normal}"
 fi
 
+# Add KernelSU support
+curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+
 # Functions
 clang_build () {
     make -j4 O=$out \

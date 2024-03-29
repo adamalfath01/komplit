@@ -1,0 +1,23 @@
+name: Compile Kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    steps:
+       - uses: actions/checkout@v4
+       - name: Configuring git environment.
+         run: |
+            git config --global user.name ${{ secrets.NAME }}
+            git config --global user.email ${{ secrets.EMAIL }}
+
+       - name: Building Kernel.
+         run: |
+             chmod 777 test.sh
+             ./test.sh
+
+       - name: Uploading ZIP.
+         run: |
+             bash <(curl -s https://devuploads.com/upload.sh) -f filePath -k ${{ secrets.DEVUPLOAD }}
